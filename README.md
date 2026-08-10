@@ -30,10 +30,14 @@ Riotの公式APIではないため利用規約上グレーゾーンである点�
 
 - **Riot Client(ランチャー)** がインストールされていて、`/store` を使いたい間は
   常にバックグラウンドで起動 & ログイン済みであること(VALORANT本体は起動不要)
+- macOS / Windows で動作します(Riot ClientがLinuxに対応していないため、Linuxでは
+  動きません)
 
 ## セットアップ
 
 ### 1. 依存関係のインストール
+
+**macOS / Linux**
 
 ```bash
 cd ~/valorant-store-bot
@@ -41,6 +45,18 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+**Windows(PowerShell)**
+
+```powershell
+cd valorant-store-bot
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+以降のコマンド例はmacOS向け(`python ...`)で記載していますが、Windowsでも同じ
+コマンドをそのまま(有効化した仮想環境内で)実行すれば問題ありません。
 
 ### 2. Discord Botの作成
 
@@ -101,9 +117,61 @@ Riot Clientが起動していないタイミングと重なった場合は取得
 ## 常時稼働させたい場合
 
 `/store` をいつでも実行できるようにするには、`bot.py` に加えて **Riot Clientも
-バックグラウンドで起動したまま** にしておく必要があります。PCを閉じても動かし
-続けたい場合は、`pm2` や `systemd`などで `python bot.py` をバックグラウンド実行
-しつつ、Riot Clientも同じマシン上で起動し続けてください。
+バックグラウンドで起動したまま** にしておく必要があります。
+
+**macOS**: `launchd`(LaunchAgent)に登録するのがおすすめです。
+`~/Library/LaunchAgents/` に以下のような内容のplistを作成し、
+`launchctl bootstrap gui/$(id -u) <plistのパス>` で登録します。
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.valorant-store-bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/valorant-store-bot/.venv/bin/python</string>
+        <string>-u</string>
+        <string>/path/to/valorant-store-bot/bot.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/valorant-store-bot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/path/to/valorant-store-bot/logs/bot.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/valorant-store-bot/logs/bot.err.log</string>
+</dict>
+</plist>
+```
+
+ノートPCの蓋を閉じても止めたくない場合は、Apple Siliconでは
+`pmset disablesleep` が効かないことがあるため、蓋を開けたまま
+ディスプレイだけスリープさせるか、Amphetamine等のアプリ、または
+外部ディスプレイ接続によるクラムシェルモードを利用してください。
+
+**Windows**: タスクスケジューラに登録するのが簡単です。
+
+1. 「タスクスケジューラ」を開き、「基本タスクの作成」
+2. トリガーを「ログオン時」に設定
+3. 操作で「プログラムの開始」→ プログラムに
+   `<venvのパス>\Scripts\python.exe`、引数に `-u bot.py`、
+   開始(作業)フォルダーにプロジェクトのフォルダーを指定
+4. タスクのプロパティで「最上位の特権で実行する」と
+   「ユーザーがログオンしているかどうかにかかわらず実行する」を有効にすると、
+   ログオフ中や他ユーザー切り替え中も動き続けます
+
+ノートPCの蓋を閉じても止めたくない場合は、「コントロールパネル→電源オプション→
+カバーを閉じたときの動作」を「何もしない」に設定してください(電源接続時のみの
+設定にしておくと安全です)。
 
 ## うまく取得できない場合
 
