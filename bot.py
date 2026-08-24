@@ -14,7 +14,7 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from riot_auth import RiotAuth, RiotAuthError
+from riot_auth import RiotAuth, RiotAuthError, RiotClientNotRunningError
 from valorant_store import get_daily_skins
 
 load_dotenv()
@@ -28,6 +28,11 @@ VALORANT_RED = 0xFF4655
 REFRESH_BUFFER_SECONDS = 120
 # Riot Client未起動などで取得に失敗した場合のリトライ間隔
 RETRY_SECONDS = 300
+# Riot Clientを自動起動した直後のリトライ間隔(起動・ログインは数十秒で終わることが多いため短め)
+RETRY_SECONDS_AFTER_LAUNCH = 30
+# /store コマンドでRiot Clientの自動起動〜ログイン完了を待つ最大時間・ポーリング間隔
+STORE_COMMAND_LAUNCH_TIMEOUT = 90
+STORE_COMMAND_POLL_INTERVAL = 5
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -81,7 +86,11 @@ async def store_notifier_loop():
         try:
             await asyncio.to_thread(auth.ensure_valid)
             skins, remaining = await asyncio.to_thread(get_daily_skins, auth)
-        except Exception as e:  # noqa: BLE001 - Riot Client未起動等はログに残してリトライ
+        except RiotClientNotRunningError as e:
+            print(f"[notifier] {e} {RETRY_SECONDS_AFTER_LAUNCH}秒後にリトライします")
+            await asyncio.sleep(RETRY_SECONDS_AFTER_LAUNCH)
+            continue
+        except Exception as e:  # noqa: BLE001 - その他の失敗もログに残してリトライ
             print(f"[notifier] ストア取得に失敗しました。{RETRY_SECONDS}秒後にリトライします: {e}")
             await asyncio.sleep(RETRY_SECONDS)
             continue
@@ -106,14 +115,44 @@ async def on_ready():
         client.loop.create_task(store_notifier_loop())
 
 
+async def _ensure_riot_ready(interaction: discord.Interaction) -> bool:
+    """Riot Clientのセッションを確立する。未起動なら自動起動し、ログイン完了まで待つ。
+
+    成功すれば True を返す。諦めた場合は followup でユーザーに通知したうえで False を返す。
+    """
+    try:
+        await asyncio.to_thread(auth.ensure_valid)
+        return True
+    except RiotClientNotRunningError:
+        pass
+    except RiotAuthError as e:
+        await interaction.followup.send(f"ログインに失敗しました: {e}")
+        return False
+
+    await interaction.followup.send(
+        "Riot Clientが起動していなかったため自動的に起動しました。ログイン完了を待っています…"
+    )
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + STORE_COMMAND_LAUNCH_TIMEOUT
+    while loop.time() < deadline:
+        await asyncio.sleep(STORE_COMMAND_POLL_INTERVAL)
+        try:
+            await asyncio.to_thread(auth.ensure_valid)
+            return True
+        except RiotAuthError:
+            continue
+
+    await interaction.followup.send(
+        "Riot Clientの起動待ちがタイムアウトしました。手動でログインしてから、もう一度 /store を実行してください。"
+    )
+    return False
+
+
 @tree.command(name="store", description="本日のVALORANTストア(デイリーショップ)を表示します")
 async def store_command(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    try:
-        await asyncio.to_thread(auth.ensure_valid)
-    except RiotAuthError as e:
-        await interaction.followup.send(f"ログインに失敗しました: {e}")
+    if not await _ensure_riot_ready(interaction):
         return
 
     try:

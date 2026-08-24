@@ -17,6 +17,8 @@ import base64
 import json
 import platform
 import re
+import subprocess
+import time
 from pathlib import Path
 
 import requests
@@ -28,6 +30,10 @@ from curl_cffi import requests as cffi_requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ENTITLEMENTS_LOCAL_PATH = "/entitlements/v1/token"
+
+# Riot Client自動起動を試みてから、再度自動起動を試みるまでの最短間隔(秒)。
+# ログイン完了まで数十秒かかることがあるため、その間に何度も起動し直さないようにする。
+RIOT_CLIENT_LAUNCH_COOLDOWN = 60
 
 CLIENT_PLATFORM = base64.b64encode(
     json.dumps(
@@ -43,6 +49,42 @@ CLIENT_PLATFORM = base64.b64encode(
 
 class RiotAuthError(Exception):
     pass
+
+
+class RiotClientNotRunningError(RiotAuthError):
+    """Riot Clientが起動しておらず、自動起動を試みたことを示す。呼び出し側は
+    しばらく待って ensure_valid() をリトライすることを期待されている。"""
+
+
+def _riot_client_executable() -> Path | None:
+    """インストール済みのRiot Client実行ファイルのパスを取得する(Windowsのみ)。"""
+    import os
+
+    installs_path = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Riot Games/RiotClientInstalls.json"
+    if not installs_path.exists():
+        return None
+    try:
+        data = json.loads(installs_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    exe = data.get("rc_live") or data.get("rc_default")
+    return Path(exe) if exe else None
+
+
+def launch_riot_client() -> bool:
+    """Riot Clientの起動を試みる。起動コマンドを実行できたら True を返す
+    (ログイン完了や起動完了までは待たない)。"""
+    system = platform.system()
+    if system == "Windows":
+        exe = _riot_client_executable()
+        if exe is None or not exe.exists():
+            return False
+        subprocess.Popen([str(exe)])
+        return True
+    if system == "Darwin":
+        subprocess.Popen(["open", "-a", "Riot Client"])
+        return True
+    return False
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -73,15 +115,39 @@ class RiotAuth:
         self.puuid = None
         self.region = None
         self.client_version = None
+        self._last_launch_attempt = 0.0
 
-    def ensure_valid(self):
+    def _try_auto_launch(self) -> bool:
+        """クールダウンを考慮してRiot Clientの自動起動を試みる。
+
+        直近で起動を試みたばかりの場合は再度起動コマンドは実行せず、
+        「起動処理は進行中」として True を返す(呼び出し側はリトライ待ちをする)。
+        """
+        now = time.monotonic()
+        if now - self._last_launch_attempt < RIOT_CLIENT_LAUNCH_COOLDOWN:
+            return True
+        launched = launch_riot_client()
+        if launched:
+            self._last_launch_attempt = now
+        return launched
+
+    def ensure_valid(self, auto_launch: bool = True):
         """Riot Clientのlockfileからローカルセッション情報を読み、トークンを取得する。
 
         Riot Clientはプロセスが生きている限り内部でトークンを自動更新し続けるため、
         呼び出すたびにローカルAPIから最新のものを取得し直す(キャッシュはしない)。
+
+        Riot Clientが起動していない場合、auto_launch=True(デフォルト)であれば自動起動を
+        試みたうえで RiotClientNotRunningError を送出する。呼び出し側はしばらく待って
+        再度 ensure_valid() を呼び直すことを想定している。
         """
         path = _lockfile_path()
         if not path.exists():
+            if auto_launch and self._try_auto_launch():
+                raise RiotClientNotRunningError(
+                    "Riot Clientが起動していなかったため自動的に起動しました。"
+                    "ログインが完了するまでしばらくお待ちください。"
+                )
             raise RiotAuthError(
                 "Riot Clientのlockfileが見つかりません。"
                 "Riot Client(ランチャー。VALORANT本体の起動は不要)を起動してログインしてください。"
@@ -103,6 +169,11 @@ class RiotAuth:
             r.raise_for_status()
             data = r.json()
         except requests.RequestException as e:
+            if auto_launch and self._try_auto_launch():
+                raise RiotClientNotRunningError(
+                    f"Riot Clientのローカルセッション取得に失敗したため自動的に起動しました: {e}\n"
+                    "ログインが完了するまでしばらくお待ちください。"
+                ) from e
             raise RiotAuthError(
                 f"Riot Clientのローカルセッション取得に失敗しました: {e}\n"
                 "Riot Clientが起動していてログイン済みか確認してください。"
