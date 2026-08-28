@@ -13,6 +13,7 @@ VALORANTには公式のストア確認APIは存在しない。このツールは
     ログイン済みであること。
 """
 
+import asyncio
 import base64
 import json
 import platform
@@ -194,6 +195,39 @@ class RiotAuth:
         if self._verified_region is None:
             self._verified_region = self._resolve_working_shard(self._guess_shard_hint())
         self.region = self._verified_region
+
+    async def ensure_valid_with_retry(self, timeout: float = 90, poll_interval: float = 5, on_waiting=None) -> bool:
+        """ensure_valid()をラップし、Riot Client未起動時は自動起動を待って
+        timeout秒までポーリングする。/store コマンドとスリープ復帰後の
+        一括通知スクリプトの両方から共通で使う。
+
+        成功すれば True、timeout以内に確立できなければ False を返す
+        (RiotAuthErrorをそのまま送出したい呼び出し元は使わないこと)。
+        on_waiting: 自動起動を検知した最初の1回だけ呼ばれるコールバック(async可)。
+        """
+        try:
+            await asyncio.to_thread(self.ensure_valid)
+            return True
+        except RiotClientNotRunningError:
+            pass
+        except RiotAuthError:
+            return False
+
+        if on_waiting is not None:
+            result = on_waiting()
+            if asyncio.iscoroutine(result):
+                await result
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                await asyncio.to_thread(self.ensure_valid)
+                return True
+            except RiotAuthError:
+                continue
+        return False
 
     def _guess_shard_hint(self) -> str | None:
         """access_tokenのJWTペイロードに埋め込まれた "dat.c"(例: "ap1")からシャード名を

@@ -105,15 +105,16 @@ Discordアプリからでも可)で `/store` と入力すれば本日のスト�
 
 ## 自動通知
 
-`DISCORD_CHANNEL_ID` を設定していると、Botはストアの残り時間を見ながら次の更新
-タイミングを自分で計算し、更新される頃に自動的に指定チャンネルへ通知します
-(更新直後はサーバー反映が少し遅れることがあるため、2分ほど余裕を持って取得します)。
-通知後は、そのとき取得した新しい残り時間から次の通知タイミングを再計算する、
-というのを繰り返します。
+`DISCORD_CHANNEL_ID` を設定していると、`notify_once.py` が本日のストアを1回だけ
+取得してそのチャンネルへ送信し、終了します。常駐する `bot.py`(`/store` コマンド用)
+とは別プロセスとして、ストア更新時刻の少し後に**1日1回だけ**実行する使い方を想定して
+います(タスクスケジューラ/launchdでスケジュールする。後述)。
 
 Riot Clientが起動していないタイミングと重なった場合は自動的にRiot Clientの起動を
-試みたうえで取得をリトライし続けます(ログは `logs/bot.log` に出力され、5MB x 5世代で
-自動的にローテーションされます)。
+試みたうえで、最大3分ほどログイン完了を待ちます。それでもダメだった場合はログに
+記録して何もせず終了します(翌日また実行されます)。ログは `logs/notify.log`
+(`/store` コマンド用の `bot.py` は `logs/bot.log`)に出力され、それぞれ5MB x 5世代で
+自動的にローテーションされます。
 
 ## 常時稼働させたい場合
 
@@ -159,34 +160,51 @@ Riot Clientが起動していないタイミングと重なった場合は自動
 ディスプレイだけスリープさせるか、Amphetamine等のアプリ、または
 外部ディスプレイ接続によるクラムシェルモードを利用してください。
 
-**Windows**: タスクスケジューラに登録するのが簡単です。`start_bot.bat`(クラッシュ時に
-15秒後へ自動再起動するループ入り)を `run_hidden.vbs`(コマンドプロンプトの
-ウィンドウを表示せずに起動する)経由で呼ぶ構成にしています。
+**Windows**: タスクを2つ、役割を分けて登録します。
 
-1. 「タスクスケジューラ」を開き、「基本タスクの作成」
-2. トリガーを「ログオン時」に設定(ネットワーク初期化を待つため30秒程度の
-   遅延を入れておくと、起動直後のDNS失敗を避けられます)
-3. 操作で「プログラムの開始」→ プログラムに `wscript.exe`、引数に
-   `"<プロジェクトのパス>\run_hidden.vbs"`、開始(作業)フォルダーに
-   プロジェクトのフォルダーを指定
-4. 「ユーザーがログオンしているときのみ実行する」のままで問題ありません
-   (このBotは管理者権限を必要としません)
+1. **`ValorantStoreBot`**(`/store` コマンド用・常駐): ログオン時に自動起動し、
+   PCが起きている間だけ動く。`start_bot.bat`(クラッシュ時に15秒後へ自動再起動する
+   ループ入り)を `run_hidden.vbs`(コマンドプロンプトのウィンドウを表示せずに
+   起動する)経由で呼ぶ構成。
+2. **`ValorantStoreBotNotify`**(1日1回の自動通知用): 毎日決まった時刻に
+   **スリープ中のPCを起こして**実行し、`notify_once.py` がストアを取得して
+   Discordへ送信したら終了する。実行時刻は、ストアの更新時刻(アカウントごとに
+   ほぼ固定)より数分後に設定する(サーバー反映のズレとスリープ復帰の遅延を
+   吸収するため)。
 
-PowerShellで一括登録する場合の例:
+PCが起きていない間は `/store` コマンドは使えませんが、1日1回の自動通知だけは
+スリープ中でも届きます。
 
 ```powershell
+# 1. /store コマンド用(常駐・ログオン時起動)
 $wd = "<プロジェクトのパス>"
 $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$wd\run_hidden.vbs`"" -WorkingDirectory $wd
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:USERNAME"
-$trigger.Delay = "PT30S"
+$trigger.Delay = "PT30S"  # ログオン直後はネットワーク初期化が間に合わないことがあるため
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Days 0)
 Register-ScheduledTask -TaskName "ValorantStoreBot" -Action $action -Trigger $trigger -Settings $settings
+
+# 2. 1日1回の自動通知(スリープ復帰対応)。09:05 の部分は実際のストア更新時刻+数分に置き換える
+$pythonw = "$wd\.venv\Scripts\pythonw.exe"
+$notifyAction = New-ScheduledTaskAction -Execute $pythonw -Argument "-u notify_once.py" -WorkingDirectory $wd
+$notifyTrigger = New-ScheduledTaskTrigger -Daily -At "09:05"
+$notifySettings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+Register-ScheduledTask -TaskName "ValorantStoreBotNotify" -Action $notifyAction -Trigger $notifyTrigger -Settings $notifySettings
 ```
 
-ノートPCの蓋を閉じても止めたくない場合は、「コントロールパネル→電源オプション→
-カバーを閉じたときの動作」を「何もしない」に設定してください(電源接続時のみの
-設定にしておくと安全です)。また「電源とスリープ」設定でスリープを「なし」に
-しておかないと、スリープ中はBotも止まります。
+`ValorantStoreBotNotify` は `pythonw.exe`(コンソールを持たないPython)を
+**タスクスケジューラから直接**起動する点がポイントです。`run_hidden.vbs`のように
+プロセスを切り離すと、タスクスケジューラが実プロセスの終了を検知できず、
+スリープ復帰で確保したはずの「起きている時間」がすぐ終わってしまいます。
+
+このBotはどちらも管理者権限を必要としないので、タスクの「実行するには
+ユーザーがログオンしている必要がある」のままで問題ありません。
+
+普段の運用ではWindowsの通常のアイドルタイムアウトでスリープさせておけば
+十分です(「電源とスリープ」の「AC電源接続時、次の時間が経過後PCをスリープ状態
+にする」)。ノートPCの蓋を閉じても止めたくない場合は、「コントロールパネル→
+電源オプション→カバーを閉じたときの動作」を「何もしない」に設定してください
+(電源接続時のみの設定にしておくと安全です)。
 
 ### 365日稼働させる場合の耐障害性について
 
@@ -200,6 +218,11 @@ Register-ScheduledTask -TaskName "ValorantStoreBot" -Action $action -Trigger $tr
   (通常は空)を拾うための最終防衛ラインで、5MBを超えたら自動的に削除されます。
 - PC再起動後もログオン時に自動起動しますが、ネットワークの初期化が
   間に合わないことがあるため、ログオンから30秒の遅延を入れています。
+- `notify_once.py`(1日1回の自動通知)はスリープ復帰直後の実行になるため、
+  ネットワークやRiot Clientの準備がより遅れやすいことを見込んで、Riot Client
+  起動待ちを最大3分(`/store` コマンドは1分半)に長めに取ってあります。それでも
+  `client.run()` 自体が失敗した場合(コンソールを持たない`pythonw.exe`実行のため
+  何も表示されない)は `logs/notify.log` に必ず記録されるようになっています。
 
 ## うまく取得できない場合
 
