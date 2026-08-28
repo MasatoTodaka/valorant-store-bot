@@ -31,6 +31,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ENTITLEMENTS_LOCAL_PATH = "/entitlements/v1/token"
 
+# ストアAPI(pd.<shard>.a.pvp.net)として実際に存在が確認できているshard。
+# Riot側でdat.c(推定シャード名)の命名規則が変わり、DNSすら引けない値になることが
+# あるため、既知のshardをフォールバック候補として順に試す。
+KNOWN_SHARDS = ("ap", "na", "eu", "kr", "latam", "br")
+
 # Riot Client自動起動を試みてから、再度自動起動を試みるまでの最短間隔(秒)。
 # ログイン完了まで数十秒かかることがあるため、その間に何度も起動し直さないようにする。
 RIOT_CLIENT_LAUNCH_COOLDOWN = 60
@@ -116,6 +121,7 @@ class RiotAuth:
         self.region = None
         self.client_version = None
         self._last_launch_attempt = 0.0
+        self._verified_region = None
 
     def _try_auto_launch(self) -> bool:
         """クールダウンを考慮してRiot Clientの自動起動を試みる。
@@ -183,16 +189,39 @@ class RiotAuth:
         self.entitlements_token = data.get("token") or data.get("entitlements_token")
         self.puuid = data["subject"]
 
-        # access_tokenのJWTペイロードに埋め込まれた "dat.c"(例: "ap1")が実際の
-        # VALORANTシャード名。末尾の数字を除いた "ap" がストアAPIのホスト名
-        # (pd.ap.a.pvp.net 等)に使う値。riotclient/region-localeが返す値は
-        # 国/言語ロケール(例: "JP")であり、シャード名とは別物なので使えない。
+        # 一度確認できたshardはアカウントに紐づく値としてプロセス内でキャッシュする
+        # (毎回APIを試し打ちしてshardを再検証するのは無駄なため)。
+        if self._verified_region is None:
+            self._verified_region = self._resolve_working_shard(self._guess_shard_hint())
+        self.region = self._verified_region
+
+    def _guess_shard_hint(self) -> str | None:
+        """access_tokenのJWTペイロードに埋め込まれた "dat.c"(例: "ap1")からシャード名を
+        推測する。末尾の数字を除いた "ap" がストアAPIのホスト名(pd.ap.a.pvp.net 等)に
+        使われてきた値だが、Riot側でこの命名規則が変わりDNSも引けない値になることがあるため、
+        あくまで最初に試す「ヒント」として扱い、_resolve_working_shard 側で実際に検証する。"""
         try:
             claims = _decode_jwt_payload(self.access_token)
             shard = claims["dat"]["c"]
-            self.region = re.sub(r"\d+$", "", shard).lower()
-        except (KeyError, IndexError, ValueError) as e:
-            raise RiotAuthError(f"access_tokenからリージョンを取得できませんでした: {e}") from e
+            return re.sub(r"\d+$", "", shard).lower()
+        except (KeyError, IndexError, ValueError):
+            return None
+
+    def _resolve_working_shard(self, hinted_shard: str | None) -> str:
+        """ヒントのshardをまず試し、ダメなら既知のshardを順に試して、実際に
+        ストアAPIが200を返すものを採用する。"""
+        candidates = list(dict.fromkeys(s for s in (hinted_shard, *KNOWN_SHARDS) if s))
+        last_error = "候補なし"
+        for shard in candidates:
+            try:
+                url = f"https://pd.{shard}.a.pvp.net/store/v1/wallet/{self.puuid}"
+                r = self.session.get(url, headers=self.pvp_headers(), timeout=8)
+                if r.status_code == 200:
+                    return shard
+                last_error = f"{shard}: HTTP {r.status_code}"
+            except Exception as e:  # noqa: BLE001 - 候補を順に試すため失敗は握りつぶして次へ
+                last_error = f"{shard}: {e}"
+        raise RiotAuthError(f"利用可能なリージョン(shard)を特定できませんでした(最後の試行: {last_error})")
 
     def pvp_headers(self):
         return {
