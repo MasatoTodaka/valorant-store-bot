@@ -111,8 +111,9 @@ Discordアプリからでも可)で `/store` と入力すれば本日のスト�
 通知後は、そのとき取得した新しい残り時間から次の通知タイミングを再計算する、
 というのを繰り返します。
 
-Riot Clientが起動していないタイミングと重なった場合は取得に失敗しますが、
-5分おきに自動でリトライし続けます(ログは `logs/bot.err.log` に出力されます)。
+Riot Clientが起動していないタイミングと重なった場合は自動的にRiot Clientの起動を
+試みたうえで取得をリトライし続けます(ログは `logs/bot.log` に出力され、5MB x 5世代で
+自動的にローテーションされます)。
 
 ## 常時稼働させたい場合
 
@@ -158,20 +159,47 @@ Riot Clientが起動していないタイミングと重なった場合は取得
 ディスプレイだけスリープさせるか、Amphetamine等のアプリ、または
 外部ディスプレイ接続によるクラムシェルモードを利用してください。
 
-**Windows**: タスクスケジューラに登録するのが簡単です。
+**Windows**: タスクスケジューラに登録するのが簡単です。`start_bot.bat`(クラッシュ時に
+15秒後へ自動再起動するループ入り)を `run_hidden.vbs`(コマンドプロンプトの
+ウィンドウを表示せずに起動する)経由で呼ぶ構成にしています。
 
 1. 「タスクスケジューラ」を開き、「基本タスクの作成」
-2. トリガーを「ログオン時」に設定
-3. 操作で「プログラムの開始」→ プログラムに
-   `<venvのパス>\Scripts\python.exe`、引数に `-u bot.py`、
-   開始(作業)フォルダーにプロジェクトのフォルダーを指定
-4. タスクのプロパティで「最上位の特権で実行する」と
-   「ユーザーがログオンしているかどうかにかかわらず実行する」を有効にすると、
-   ログオフ中や他ユーザー切り替え中も動き続けます
+2. トリガーを「ログオン時」に設定(ネットワーク初期化を待つため30秒程度の
+   遅延を入れておくと、起動直後のDNS失敗を避けられます)
+3. 操作で「プログラムの開始」→ プログラムに `wscript.exe`、引数に
+   `"<プロジェクトのパス>\run_hidden.vbs"`、開始(作業)フォルダーに
+   プロジェクトのフォルダーを指定
+4. 「ユーザーがログオンしているときのみ実行する」のままで問題ありません
+   (このBotは管理者権限を必要としません)
+
+PowerShellで一括登録する場合の例:
+
+```powershell
+$wd = "<プロジェクトのパス>"
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$wd\run_hidden.vbs`"" -WorkingDirectory $wd
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:USERNAME"
+$trigger.Delay = "PT30S"
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Days 0)
+Register-ScheduledTask -TaskName "ValorantStoreBot" -Action $action -Trigger $trigger -Settings $settings
+```
 
 ノートPCの蓋を閉じても止めたくない場合は、「コントロールパネル→電源オプション→
 カバーを閉じたときの動作」を「何もしない」に設定してください(電源接続時のみの
-設定にしておくと安全です)。
+設定にしておくと安全です)。また「電源とスリープ」設定でスリープを「なし」に
+しておかないと、スリープ中はBotも止まります。
+
+### 365日稼働させる場合の耐障害性について
+
+- `start_bot.bat` はbot.pyが(未処理の例外などで)終了しても15秒後に自動的に
+  再起動するループになっています。タスクスケジューラの「失敗時の再起動」設定は
+  `wscript.exe` 経由の起動では効かない(実プロセスがタスクから見て「切り離される」
+  ため)ので、このバッチファイル側のループが実質的な自動復旧の仕組みです。
+- ログは `logs/bot.log` に出力され、5MB x 5世代でローテーションされます
+  (Pythonの `RotatingFileHandler` によるもので、際限なく肥大化しません)。
+- `logs/bot.crash.log` は、ロギング機構が破損するレベルの想定外のクラッシュ
+  (通常は空)を拾うための最終防衛ラインで、5MBを超えたら自動的に削除されます。
+- PC再起動後もログオン時に自動起動しますが、ネットワークの初期化が
+  間に合わないことがあるため、ログオンから30秒の遅延を入れています。
 
 ## うまく取得できない場合
 

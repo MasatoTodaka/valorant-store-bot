@@ -8,6 +8,8 @@ DISCORD_CHANNEL_ID が設定されている場合、ストアの更新タイミ�
 """
 
 import asyncio
+import logging
+import logging.handlers
 import os
 
 import discord
@@ -18,6 +20,16 @@ from riot_auth import RiotAuth, RiotAuthError, RiotClientNotRunningError
 from valorant_store import get_daily_skins
 
 load_dotenv()
+
+# 365日稼働させ続けても際限なく肥大化しないよう、ログは5MB x 5世代でローテーションする。
+os.makedirs("logs", exist_ok=True)
+_log_handler = logging.handlers.RotatingFileHandler(
+    filename="logs/bot.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_log_handler.setFormatter(logging.Formatter("[{asctime}] [{levelname:<8}] {name}: {message}", style="{"))
+logger = logging.getLogger("valorant_store_bot")
+logger.addHandler(_log_handler)
+logger.setLevel(logging.INFO)
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID")  # 指定するとそのサーバーだけ即時反映される
@@ -69,10 +81,10 @@ async def store_notifier_loop():
     try:
         channel = await client.fetch_channel(int(CHANNEL_ID))
     except discord.DiscordException as e:
-        print(f"[notifier] チャンネル({CHANNEL_ID})の取得に失敗したため自動通知は無効です: {e}")
+        logger.error(f"[notifier] チャンネル({CHANNEL_ID})の取得に失敗したため自動通知は無効です: {e}")
         return
 
-    print(f"[notifier] 自動通知を開始します(通知先: #{getattr(channel, 'name', CHANNEL_ID)})")
+    logger.info(f"[notifier] 自動通知を開始します(通知先: #{getattr(channel, 'name', CHANNEL_ID)})")
 
     # 起動直後は「今のストア」をいきなり通知せず、次の更新タイミングまで待つだけにする
     try:
@@ -80,22 +92,30 @@ async def store_notifier_loop():
         _, remaining = await asyncio.to_thread(get_daily_skins, auth)
         await asyncio.sleep(max(remaining, 0) + REFRESH_BUFFER_SECONDS)
     except Exception as e:  # noqa: BLE001 - 起動時の失敗は下のループに委ねる
-        print(f"[notifier] 初回チェックに失敗しました(下のループでリトライします): {e}")
+        logger.warning(f"[notifier] 初回チェックに失敗しました(下のループでリトライします): {e}")
 
+    # 1回のループ処理で何が起きても(取得失敗・送信失敗・想定外の例外)このタスク自体は
+    # 絶対に落とさない。落ちると復旧手段がなく、以降ずっと自動通知が届かなくなるため。
     while not client.is_closed():
         try:
             await asyncio.to_thread(auth.ensure_valid)
             skins, remaining = await asyncio.to_thread(get_daily_skins, auth)
         except RiotClientNotRunningError as e:
-            print(f"[notifier] {e} {RETRY_SECONDS_AFTER_LAUNCH}秒後にリトライします")
+            logger.info(f"[notifier] {e} {RETRY_SECONDS_AFTER_LAUNCH}秒後にリトライします")
             await asyncio.sleep(RETRY_SECONDS_AFTER_LAUNCH)
             continue
         except Exception as e:  # noqa: BLE001 - その他の失敗もログに残してリトライ
-            print(f"[notifier] ストア取得に失敗しました。{RETRY_SECONDS}秒後にリトライします: {e}")
+            logger.warning(f"[notifier] ストア取得に失敗しました。{RETRY_SECONDS}秒後にリトライします: {e}")
             await asyncio.sleep(RETRY_SECONDS)
             continue
 
-        await channel.send(embeds=build_store_embeds(skins, remaining))
+        try:
+            await channel.send(embeds=build_store_embeds(skins, remaining))
+        except Exception as e:  # noqa: BLE001 - 送信失敗でループを止めない
+            logger.warning(f"[notifier] 通知の送信に失敗しました。{RETRY_SECONDS}秒後にリトライします: {e}")
+            await asyncio.sleep(RETRY_SECONDS)
+            continue
+
         await asyncio.sleep(max(remaining, 0) + REFRESH_BUFFER_SECONDS)
 
 
@@ -108,7 +128,7 @@ async def on_ready():
         await tree.sync(guild=guild)
     else:
         await tree.sync()
-    print(f"Logged in as {client.user} (guild sync: {GUILD_ID or 'global'})")
+    logger.info(f"Logged in as {client.user} (guild sync: {GUILD_ID or 'global'})")
 
     if CHANNEL_ID and not _notifier_started:
         _notifier_started = True
@@ -165,4 +185,4 @@ async def store_command(interaction: discord.Interaction):
 
 
 if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)
+    client.run(DISCORD_TOKEN, log_handler=_log_handler)
