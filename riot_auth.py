@@ -16,6 +16,7 @@ VALORANTには公式のストア確認APIは存在しない。このツールは
 import asyncio
 import base64
 import json
+import logging
 import platform
 import re
 import subprocess
@@ -29,6 +30,8 @@ from curl_cffi import requests as cffi_requests
 # Riot Clientのローカルサーバーは自己署名証明書を使うため証明書検証を無効化する。
 # (127.0.0.1宛のみ・Riot Client自身が発行した証明書であることを理解した上での無効化)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger("riot_auth")
 
 ENTITLEMENTS_LOCAL_PATH = "/entitlements/v1/token"
 
@@ -79,17 +82,25 @@ def _riot_client_executable() -> Path | None:
 
 def launch_riot_client() -> bool:
     """Riot Clientの起動を試みる。起動コマンドを実行できたら True を返す
-    (ログイン完了や起動完了までは待たない)。"""
+    (ログイン完了や起動完了までは待たない)。失敗しても例外は投げず False を返す
+    (呼び出し側でリトライするため、ここで例外を伝播させると回復不能になる)。"""
     system = platform.system()
-    if system == "Windows":
-        exe = _riot_client_executable()
-        if exe is None or not exe.exists():
-            return False
-        subprocess.Popen([str(exe)])
-        return True
-    if system == "Darwin":
-        subprocess.Popen(["open", "-a", "Riot Client"])
-        return True
+    try:
+        if system == "Windows":
+            exe = _riot_client_executable()
+            if exe is None or not exe.exists():
+                logger.warning(f"Riot Clientの実行ファイルが見つかりません(検出結果: {exe})")
+                return False
+            subprocess.Popen([str(exe)])
+            logger.info(f"Riot Clientの起動コマンドを実行しました: {exe}")
+            return True
+        if system == "Darwin":
+            subprocess.Popen(["open", "-a", "Riot Client"])
+            logger.info("Riot Clientの起動コマンドを実行しました(open -a)")
+            return True
+    except OSError as e:
+        logger.warning(f"Riot Clientの起動コマンドの実行に失敗しました: {e}")
+        return False
     return False
 
 
@@ -197,37 +208,37 @@ class RiotAuth:
         self.region = self._verified_region
 
     async def ensure_valid_with_retry(self, timeout: float = 90, poll_interval: float = 5, on_waiting=None) -> bool:
-        """ensure_valid()をラップし、Riot Client未起動時は自動起動を待って
-        timeout秒までポーリングする。/store コマンドとスリープ復帰後の
-        一括通知スクリプトの両方から共通で使う。
+        """ensure_valid()をラップし、失敗している間はtimeout秒までポーリングし続ける。
+        /store コマンドとスリープ復帰後の一括通知スクリプトの両方から共通で使う。
+
+        「Riot Clientの起動コマンド自体が(スリープ復帰直後の一時的な不調などで)失敗した」
+        場合も含めて、原因を問わず一律でリトライする(1回失敗しただけで諦めない)。
+        毎回のensure_valid()呼び出しがRiot Clientの再起動を試みるため、根本原因が
+        解消されればそのうち成功する。
 
         成功すれば True、timeout以内に確立できなければ False を返す
         (RiotAuthErrorをそのまま送出したい呼び出し元は使わないこと)。
-        on_waiting: 自動起動を検知した最初の1回だけ呼ばれるコールバック(async可)。
+        on_waiting: 最初の失敗時に1回だけ呼ばれるコールバック(async可)。
         """
-        try:
-            await asyncio.to_thread(self.ensure_valid)
-            return True
-        except RiotClientNotRunningError:
-            pass
-        except RiotAuthError:
-            return False
-
-        if on_waiting is not None:
-            result = on_waiting()
-            if asyncio.iscoroutine(result):
-                await result
-
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            await asyncio.sleep(poll_interval)
+        notified = False
+
+        while True:
             try:
                 await asyncio.to_thread(self.ensure_valid)
                 return True
-            except RiotAuthError:
-                continue
-        return False
+            except RiotAuthError as e:
+                logger.info(f"Riot Client未準備、リトライします: {e}")
+                if not notified:
+                    notified = True
+                    if on_waiting is not None:
+                        result = on_waiting()
+                        if asyncio.iscoroutine(result):
+                            await result
+                if loop.time() >= deadline:
+                    return False
+                await asyncio.sleep(poll_interval)
 
     def _guess_shard_hint(self) -> str | None:
         """access_tokenのJWTペイロードに埋め込まれた "dat.c"(例: "ap1")からシャード名を
