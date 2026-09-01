@@ -9,7 +9,9 @@ Riot Clientが未起動(スリープ復帰直後などで間に合っていな�
 
 import asyncio
 import os
+import socket
 import sys
+import time
 
 import discord
 from dotenv import load_dotenv
@@ -29,6 +31,26 @@ CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
 # スリープ復帰直後はネットワークの初期化が遅れることがあるため、/store コマンドより長めに待つ
 LAUNCH_TIMEOUT = 180
 POLL_INTERVAL = 10
+
+# discord.com へのTCP接続そのものが確立できるようになるまで待つ時間・間隔。
+# スリープ復帰直後は、DNSは引けてもTCP接続がハングして[WinError 121]
+# (セマフォがタイムアウトしました)で失敗することがあり、これはclient.run()より
+# 前で起きるため上のRiot Client向けリトライの対象外になる。
+NETWORK_WAIT_TIMEOUT = 120
+NETWORK_WAIT_INTERVAL = 5
+
+
+def wait_for_network(host: str = "discord.com", port: int = 443) -> bool:
+    deadline = time.monotonic() + NETWORK_WAIT_TIMEOUT
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except OSError as e:
+            logger.info(f"ネットワーク未準備、待機します: {e}")
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(NETWORK_WAIT_INTERVAL)
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -62,6 +84,10 @@ if __name__ == "__main__":
     if not CHANNEL_ID:
         logger.error("DISCORD_CHANNEL_ID が未設定のため終了します")
         sys.exit(1)
+    if not wait_for_network():
+        logger.error(f"{NETWORK_WAIT_TIMEOUT}秒待ってもネットワークに接続できなかったため終了します")
+        sys.exit(1)
+
     # スリープ復帰直後はネットワークの初期化が間に合わずclient.run()自体が例外を投げる
     # ことがある(pythonwにはコンソールがなく、素の例外は何も出さずに消えてしまうため、
     # 必ずログに残す)。
