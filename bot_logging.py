@@ -11,7 +11,9 @@ def setup_logging(name: str, filename: str) -> tuple[logging.Logger, logging.Han
     handler = logging.handlers.RotatingFileHandler(
         filename=filename, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    handler.setFormatter(logging.Formatter("[{asctime}] [{levelname:<8}] {name}: {message}", style="{"))
+    handler.setFormatter(
+        logging.Formatter("[{asctime}] [{levelname:<8}] {name}: {message}", style="{", datefmt="%Y-%m-%d %H:%M:%S")
+    )
 
     logger = logging.getLogger(name)
     logger.addHandler(handler)

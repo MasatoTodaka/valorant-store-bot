@@ -5,13 +5,21 @@
 
 Riot Clientが未起動(スリープ復帰直後などで間に合っていない場合を含む)なら自動起動して
 ログイン完了を待ち、それでもダメならログに残して何もせず終了する(次の起動時に再試行)。
+
+S3スリープからの復帰自体がハードウェア/ドライバ都合で失敗する(クラッシュ・強制再起動)
+ことがあり、その場合はスケジュールされたウェイク自体が実行されない。これはPython側の
+リトライでは救えないため、「ログオン時」にも同じスクリプトを実行するようタスクを
+登録し、本日まだ送信していなければここで送る、というフォールバックにしている
+(送信済みなら logs/last_notify_date.txt を見て即座に何もせず終了する)。
 """
 
 import asyncio
+import datetime
 import os
 import socket
 import sys
 import time
+from pathlib import Path
 
 import discord
 from dotenv import load_dotenv
@@ -38,6 +46,20 @@ POLL_INTERVAL = 10
 # 前で起きるため上のRiot Client向けリトライの対象外になる。
 NETWORK_WAIT_TIMEOUT = 120
 NETWORK_WAIT_INTERVAL = 5
+
+LAST_NOTIFY_MARKER = Path("logs/last_notify_date.txt")
+
+
+def already_sent_today() -> bool:
+    try:
+        saved = LAST_NOTIFY_MARKER.read_text().strip()
+    except FileNotFoundError:
+        return False
+    return saved == datetime.date.today().isoformat()
+
+
+def mark_sent_today() -> None:
+    LAST_NOTIFY_MARKER.write_text(datetime.date.today().isoformat())
 
 
 def wait_for_network(host: str = "discord.com", port: int = 443) -> bool:
@@ -73,6 +95,7 @@ async def on_ready():
         skins, remaining = await asyncio.to_thread(get_daily_skins, auth)
         channel = await client.fetch_channel(int(CHANNEL_ID))
         await channel.send(embeds=build_store_embeds(skins, remaining))
+        mark_sent_today()
         logger.info(f"通知を送信しました(残り時間: {remaining}秒)")
     except Exception:
         logger.exception("通知処理中にエラーが発生しました")
@@ -81,6 +104,10 @@ async def on_ready():
 
 
 if __name__ == "__main__":
+    if already_sent_today():
+        logger.info("本日は送信済みのため何もせず終了します")
+        sys.exit(0)
+
     if not CHANNEL_ID:
         logger.error("DISCORD_CHANNEL_ID が未設定のため終了します")
         sys.exit(1)
